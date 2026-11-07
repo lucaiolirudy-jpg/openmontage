@@ -89,7 +89,8 @@ class RemotionCaptionBurn(BaseTool):
                 "type": "array",
                 "description": (
                     "Word-level transcript segments from transcriber tool. "
-                    "Each segment has 'words' array with {word, start, end}."
+                    "Each segment has 'words' array with {word, start, end}; "
+                    "a word may set page_break_after: true to force a new caption page."
                 ),
             },
             "srt_path": {
@@ -219,11 +220,14 @@ class RemotionCaptionBurn(BaseTool):
                         trailing = raw[-1]
                     if fixed != raw and not fixed.endswith(trailing):
                         fixed = fixed + trailing
-                    captions.append({
+                    caption = {
                         "word": fixed,
                         "startMs": int(w["start"] * 1000),
                         "endMs": int(w["end"] * 1000),
-                    })
+                    }
+                    if w.get("page_break_after"):
+                        caption["pageBreakAfter"] = True
+                    captions.append(caption)
             elif "text" in seg:
                 text_words = seg["text"].strip().split()
                 dur = seg["end"] - seg["start"]
