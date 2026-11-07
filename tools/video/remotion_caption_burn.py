@@ -135,6 +135,25 @@ class RemotionCaptionBurn(BaseTool):
                     "See asset_manifest overlays from the asset-director."
                 ),
             },
+            "caption_style": {
+                "type": "object",
+                "description": (
+                    "Optional caption placement/look passed to the TalkingHead "
+                    "composition: bottom_offset (px from frame bottom), "
+                    "color, background_color (use 'transparent' for TikTok "
+                    "style), stroke_width, stroke_color, font_weight, "
+                    "font_family, text_transform ('none'|'uppercase')."
+                ),
+            },
+            "page_break_on_sentence": {
+                "type": "boolean",
+                "default": False,
+                "description": "Start a new caption page after words ending in . ? or !",
+            },
+            "fps": {
+                "type": "number",
+                "description": "Render frame rate. Defaults to the input video's frame rate.",
+            },
             "force_ffmpeg": {
                 "type": "boolean",
                 "default": False,
@@ -275,6 +294,8 @@ class RemotionCaptionBurn(BaseTool):
         font_size: int,
         highlight_color: str,
         overlays: list[dict] | None = None,
+        caption_style: dict | None = None,
+        fps: float | None = None,
     ) -> ToolResult:
         root = self._find_remotion_root()
         if root is None:
@@ -290,7 +311,19 @@ class RemotionCaptionBurn(BaseTool):
         dur_result = self.run_command(dur_cmd)
         dur_out = dur_result.stdout
         duration_s = float(dur_out.strip().split("\n")[0])
-        total_frames = math.ceil(duration_s * 30)
+        if not fps:
+            fps_result = self.run_command([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0",
+                input_path,
+            ])
+            try:
+                num, _, den = fps_result.stdout.strip().split("\n")[0].partition("/")
+                fps = float(num) / float(den or 1)
+            except (ValueError, ZeroDivisionError):
+                fps = 30.0
+        fps_str = f"{fps:g}"
+        total_frames = math.ceil(duration_s * fps)
 
         # Detect video dimensions
         dim_cmd = [
@@ -321,6 +354,19 @@ class RemotionCaptionBurn(BaseTool):
             "fontSize": font_size,
             "highlightColor": highlight_color,
         }
+        style_map = {
+            "bottom_offset": "captionBottomOffset",
+            "color": "captionColor",
+            "background_color": "captionBackgroundColor",
+            "stroke_width": "captionStrokeWidth",
+            "stroke_color": "captionStrokeColor",
+            "font_weight": "captionFontWeight",
+            "font_family": "captionFontFamily",
+            "text_transform": "captionTextTransform",
+        }
+        for key, prop in style_map.items():
+            if caption_style and caption_style.get(key) is not None:
+                props[prop] = caption_style[key]
         props_dir = root / "public" / "demo-props"
         props_dir.mkdir(parents=True, exist_ok=True)
         props_file = props_dir / f"caption-burn-{Path(input_path).stem}.json"
@@ -333,7 +379,7 @@ class RemotionCaptionBurn(BaseTool):
             npx_bin, "remotion", "render",
             "TalkingHead",
             f"--props={props_file.relative_to(root)}",
-            f"--width={width}", f"--height={height}", "--fps=30",
+            f"--width={width}", f"--height={height}", f"--fps={fps_str}",
             f"--frames=0-{total_frames - 1}",
             "--codec=h264", "--crf=18",
             f"--output={str(Path(output_path).resolve())}",
@@ -478,6 +524,11 @@ class RemotionCaptionBurn(BaseTool):
         if not captions:
             return ToolResult(success=False, error="No caption words extracted.")
 
+        if inputs.get("page_break_on_sentence"):
+            for c in captions:
+                if c["word"].rstrip().endswith((".", "?", "!")):
+                    c["pageBreakAfter"] = True
+
         overlays = inputs.get("overlays")
 
         # Choose render method
@@ -486,6 +537,8 @@ class RemotionCaptionBurn(BaseTool):
                 input_path, output_path, captions,
                 words_per_page, font_size, highlight_color,
                 overlays=overlays,
+                caption_style=inputs.get("caption_style"),
+                fps=inputs.get("fps"),
             )
         else:
             result = self._render_ffmpeg(input_path, output_path, captions)

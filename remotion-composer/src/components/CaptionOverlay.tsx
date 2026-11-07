@@ -36,6 +36,15 @@ type CaptionOverlayProps = {
   // without an explicit direction RTL words are laid out left-to-right and
   // the sentence reads backwards.
   direction?: "ltr" | "rtl" | "auto";
+  // Distance in px from the bottom of the frame to the caption block.
+  // Raise it to keep captions inside a crop safe zone (e.g. 4:5 from 9:16)
+  // or above platform UI.
+  bottomOffset?: number;
+  // Optional text outline (TikTok style, usually with a transparent box).
+  strokeWidth?: number;
+  strokeColor?: string;
+  fontWeight?: number;
+  textTransform?: "none" | "uppercase";
 };
 
 const RTL_CHAR = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
@@ -88,7 +97,12 @@ const PageRenderer: React.FC<{
   fontFamily: string;
   wordSeparator: string;
   direction: "ltr" | "rtl";
-}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, direction }) => {
+  bottomOffset: number;
+  strokeWidth: number;
+  strokeColor: string;
+  fontWeight: number;
+  textTransform: "none" | "uppercase";
+}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, direction, bottomOffset, strokeWidth, strokeColor, fontWeight, textTransform }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
@@ -106,7 +120,7 @@ const PageRenderer: React.FC<{
       style={{
         justifyContent: "flex-end",
         alignItems: "center",
-        paddingBottom: 80,
+        paddingBottom: bottomOffset,
       }}
     >
       <div
@@ -125,8 +139,15 @@ const PageRenderer: React.FC<{
         <span
           style={{
             fontSize,
-            fontWeight: 700,
+            fontWeight,
             fontFamily,
+            textTransform,
+            ...(strokeWidth > 0
+              ? {
+                  WebkitTextStroke: `${strokeWidth}px ${strokeColor}`,
+                  paintOrder: "stroke fill",
+                }
+              : {}),
             lineHeight: 1.4,
             whiteSpace: "pre-wrap",
           }}
@@ -172,6 +193,11 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
   fontFamily = "Space Grotesk, Inter, system-ui, sans-serif",
   wordSeparator = " ",
   direction = "auto",
+  bottomOffset = 80,
+  strokeWidth = 0,
+  strokeColor = "#000000",
+  fontWeight = 700,
+  textTransform = "none",
 }) => {
   const { fps } = useVideoConfig();
   const pages = buildPages(words, wordsPerPage);
@@ -199,6 +225,11 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
               fontFamily={fontFamily}
               wordSeparator={wordSeparator}
               direction={resolvedDirection}
+              bottomOffset={bottomOffset}
+              strokeWidth={strokeWidth}
+              strokeColor={strokeColor}
+              fontWeight={fontWeight}
+              textTransform={textTransform}
             />
           </Sequence>
         );

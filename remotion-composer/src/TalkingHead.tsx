@@ -308,6 +308,12 @@ export interface TalkingHeadProps {
   captionFontFamily?: string;
   // Pass "" for CJK captions (no inter-word spacing); defaults to " ".
   captionWordSeparator?: string;
+  // Caption placement/look (see CaptionOverlay). Defaults keep the old look.
+  captionBottomOffset?: number;
+  captionStrokeWidth?: number;
+  captionStrokeColor?: string;
+  captionFontWeight?: number;
+  captionTextTransform?: "none" | "uppercase";
 }
 
 export const TalkingHead: React.FC<TalkingHeadProps> = ({
@@ -321,6 +327,11 @@ export const TalkingHead: React.FC<TalkingHeadProps> = ({
   captionBackgroundColor = "rgba(0, 0, 0, 0.65)",
   captionFontFamily,
   captionWordSeparator,
+  captionBottomOffset,
+  captionStrokeWidth,
+  captionStrokeColor,
+  captionFontWeight,
+  captionTextTransform,
 }) => {
   const { fps } = useVideoConfig();
 
@@ -359,6 +370,11 @@ export const TalkingHead: React.FC<TalkingHeadProps> = ({
         color={captionColor}
         {...(captionFontFamily ? { fontFamily: captionFontFamily } : {})}
         {...(captionWordSeparator !== undefined ? { wordSeparator: captionWordSeparator } : {})}
+        {...(captionBottomOffset !== undefined ? { bottomOffset: captionBottomOffset } : {})}
+        {...(captionStrokeWidth !== undefined ? { strokeWidth: captionStrokeWidth } : {})}
+        {...(captionStrokeColor !== undefined ? { strokeColor: captionStrokeColor } : {})}
+        {...(captionFontWeight !== undefined ? { fontWeight: captionFontWeight } : {})}
+        {...(captionTextTransform !== undefined ? { textTransform: captionTextTransform } : {})}
       />
     </AbsoluteFill>
   );
