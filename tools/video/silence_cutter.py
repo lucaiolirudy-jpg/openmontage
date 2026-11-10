@@ -212,6 +212,8 @@ class SilenceCutter(BaseTool):
                 "silence_segments": len(silences),
                 "speech_segments": len(speech_segments),
                 "time_saved_percent": round(silence_dur / total_duration * 100, 1) if total_duration > 0 else 0,
+                **({"segments_path": result.data["segments_path"]}
+                   if isinstance(result.data, dict) and result.data.get("segments_path") else {}),
             },
             artifacts=[str(output_path)],
             duration_seconds=round(elapsed, 2),
@@ -301,66 +303,119 @@ class SilenceCutter(BaseTool):
         speech_segments: list[dict],
         codec: str, crf: int,
     ) -> ToolResult:
-        """Remove silence by concatenating speech segments."""
+        """Remove silence by concatenating speech segments in a single pass.
+
+        Cutting each segment to its own file and joining them with the concat
+        demuxer drifts audio against video (AAC priming plus frame rounding on
+        every segment) and leaves clicks at the joins. Instead, segment edges
+        are snapped to the video frame grid, video is kept with one ``select``
+        expression and audio with per-segment ``atrim`` + micro-fades, so both
+        streams have identical durations and stay in sync across any number of
+        cuts. A ``<output>.segments.json`` map (source -> output time) is written
+        next to the output so transcripts can be remapped without re-running ASR.
+        """
         if not speech_segments:
             return ToolResult(success=False, error="No speech segments found")
 
-        temp_dir = output_path.parent / ".silence_cut_tmp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        fps = self._get_fps(input_path) or 30.0
+        total = self._get_duration(input_path)
+        snapped: list[dict] = []
+        for seg in speech_segments:
+            s0 = round(seg["start"] * fps) / fps
+            e0 = round(seg["end"] * fps) / fps
+            if total:
+                e0 = min(e0, total)
+            if snapped and s0 <= snapped[-1]["end"]:
+                snapped[-1]["end"] = max(snapped[-1]["end"], e0)
+            elif e0 - s0 >= 1.0 / fps:
+                snapped.append({"start": s0, "end": e0})
+        if not snapped:
+            return ToolResult(success=False, error="No speech segments survived frame snapping")
 
+        eps = 0.25 / fps
+        select_expr = "+".join(
+            f"between(t,{seg['start'] - eps:.6f},{seg['end'] - eps:.6f})" for seg in snapped
+        )
+        has_audio = self._has_audio(input_path)
+        fade = 0.008
+        lines = [f"[0:v]select='{select_expr}',setpts=N/FRAME_RATE/TB[vout]"]
+        if has_audio:
+            n = len(snapped)
+            lines.append(f"[0:a]asplit={n}" + "".join(f"[as{i}]" for i in range(n)))
+            for i, seg in enumerate(snapped):
+                dur = seg["end"] - seg["start"]
+                f = min(fade, dur / 4)
+                lines.append(
+                    f"[as{i}]atrim=start={seg['start']:.6f}:end={seg['end']:.6f},"
+                    f"asetpts=PTS-STARTPTS,afade=t=in:d={f:.4f},"
+                    f"afade=t=out:st={dur - f:.6f}:d={f:.4f}[a{i}]"
+                )
+            lines.append("".join(f"[a{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1[aout]")
+        script = ";\n".join(lines)
+
+        script_path = output_path.with_name(output_path.stem + ".filter.txt")
+        script_path.write_text(script, encoding="utf-8")
         try:
-            # Cut each speech segment
-            seg_files = []
-            for i, seg in enumerate(speech_segments):
-                seg_path = temp_dir / f"seg_{i:04d}.mp4"
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(input_path),
-                    "-ss", f"{seg['start']:.3f}",
-                    "-to", f"{seg['end']:.3f}",
-                    "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-                    "-c:a", "aac", "-b:a", "192k",
-                    # Force keyframe at start for clean cuts
-                    "-force_key_frames", f"{seg['start']:.3f}",
-                    str(seg_path),
-                ]
-                self.run_command(cmd, timeout=120)
-                if seg_path.exists() and seg_path.stat().st_size > 0:
-                    seg_files.append(seg_path)
-
-            if not seg_files:
-                return ToolResult(success=False, error="No segments were successfully cut")
-
-            # Concat all segments
-            list_path = temp_dir / "concat_list.txt"
-            with open(list_path, "w", encoding="utf-8") as f:
-                for sf in seg_files:
-                    safe_path = str(sf.resolve()).replace("\\", "/")
-                    f.write(f"file '{safe_path}'\n")
-
             cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(list_path),
-                "-c", "copy",
-                str(output_path),
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-filter_complex_script", str(script_path),
+                "-map", "[vout]",
             ]
-            self.run_command(cmd, timeout=120)
-
-            return ToolResult(success=True)
+            if has_audio:
+                cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
+            cmd += [
+                "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+                "-pix_fmt", "yuv420p", "-r", f"{fps:g}",
+                "-movflags", "+faststart", str(output_path),
+            ]
+            self.run_command(cmd, timeout=3600)
         except Exception as e:
             return ToolResult(success=False, error=f"Jump cut render failed: {e}")
         finally:
-            # Clean up temp files
-            for f in temp_dir.glob("*"):
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
             try:
-                temp_dir.rmdir()
+                script_path.unlink()
             except OSError:
                 pass
+
+        offset = 0.0
+        seg_map = []
+        for seg in snapped:
+            seg_map.append({
+                "source_start": round(seg["start"], 6),
+                "source_end": round(seg["end"], 6),
+                "output_start": round(offset, 6),
+            })
+            offset += seg["end"] - seg["start"]
+        map_path = output_path.with_name(output_path.name + ".segments.json")
+        map_path.write_text(json.dumps({
+            "fps": fps, "source": str(input_path), "output": str(output_path),
+            "output_duration": round(offset, 6), "segments": seg_map,
+        }, indent=2), encoding="utf-8")
+        return ToolResult(success=True, data={"segments_path": str(map_path)})
+
+    def _get_fps(self, input_path: Path) -> float | None:
+        try:
+            result = self.run_command([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0",
+                str(input_path),
+            ])
+            num, _, den = result.stdout.strip().split("\n")[0].partition("/")
+            value = float(num) / float(den or 1)
+            return value if value > 0 else None
+        except Exception:
+            return None
+
+    def _has_audio(self, input_path: Path) -> bool:
+        try:
+            result = self.run_command([
+                "ffprobe", "-v", "error", "-select_streams", "a",
+                "-show_entries", "stream=index", "-of", "csv=p=0",
+                str(input_path),
+            ])
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
 
     def _render_speed_up(
         self,

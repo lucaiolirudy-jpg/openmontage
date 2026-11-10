@@ -30,6 +30,9 @@ type CaptionOverlayProps = {
   // Separator rendered between words. Space-delimited languages want the
   // default " "; CJK languages (no inter-word spacing) should pass "".
   wordSeparator?: string;
+  // Distance in px between the caption box and the bottom edge of the frame.
+  // Raise it on 9:16 social exports so captions clear the platform UI.
+  bottomOffset?: number;
   // Base text direction. "auto" (default) picks RTL when most words of the
   // captions are Arabic/Hebrew/Persian/Urdu. Each word is an
   // inline-block, which the bidi algorithm treats as a neutral object, so
@@ -88,7 +91,8 @@ const PageRenderer: React.FC<{
   fontFamily: string;
   wordSeparator: string;
   direction: "ltr" | "rtl";
-}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, direction }) => {
+  bottomOffset: number;
+}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, direction, bottomOffset }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
@@ -106,7 +110,7 @@ const PageRenderer: React.FC<{
       style={{
         justifyContent: "flex-end",
         alignItems: "center",
-        paddingBottom: 80,
+        paddingBottom: bottomOffset,
       }}
     >
       <div
@@ -171,6 +175,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
   backgroundColor = "rgba(15, 23, 42, 0.75)",
   fontFamily = "Space Grotesk, Inter, system-ui, sans-serif",
   wordSeparator = " ",
+  bottomOffset = 80,
   direction = "auto",
 }) => {
   const { fps } = useVideoConfig();
@@ -199,6 +204,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
               fontFamily={fontFamily}
               wordSeparator={wordSeparator}
               direction={resolvedDirection}
+              bottomOffset={bottomOffset}
             />
           </Sequence>
         );

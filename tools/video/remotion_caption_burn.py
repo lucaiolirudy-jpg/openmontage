@@ -135,6 +135,26 @@ class RemotionCaptionBurn(BaseTool):
                     "See asset_manifest overlays from the asset-director."
                 ),
             },
+            "caption_bottom_offset": {
+                "type": "integer",
+                "description": (
+                    "Distance in px between the caption box and the bottom edge. "
+                    "Defaults to 80. Raise it (e.g. ~22% of frame height) on 9:16 "
+                    "social exports so captions clear the Reels/TikTok UI."
+                ),
+            },
+            "caption_font_family": {
+                "type": "string",
+                "description": "CSS font-family for captions (Remotion only).",
+            },
+            "caption_background_color": {
+                "type": "string",
+                "description": "CSS color for the caption box, e.g. 'rgba(0,0,0,0)' for none.",
+            },
+            "fps": {
+                "type": "number",
+                "description": "Render frame rate. Defaults to the source frame rate (falls back to 30).",
+            },
             "force_ffmpeg": {
                 "type": "boolean",
                 "default": False,
@@ -266,6 +286,20 @@ class RemotionCaptionBurn(BaseTool):
     #  Remotion render
     # ------------------------------------------------------------------ #
 
+    def _probe_fps(self, input_path: str) -> float | None:
+        """Return the source video frame rate, or None if it cannot be read."""
+        result = self.run_command([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0",
+            input_path,
+        ])
+        try:
+            num, _, den = result.stdout.strip().split("\n")[0].partition("/")
+            value = float(num) / float(den or 1)
+        except (ValueError, ZeroDivisionError):
+            return None
+        return round(value, 3) if value > 0 else None
+
     def _render_remotion(
         self,
         input_path: str,
@@ -275,6 +309,8 @@ class RemotionCaptionBurn(BaseTool):
         font_size: int,
         highlight_color: str,
         overlays: list[dict] | None = None,
+        caption_style: dict[str, Any] | None = None,
+        fps: float | None = None,
     ) -> ToolResult:
         root = self._find_remotion_root()
         if root is None:
@@ -290,7 +326,9 @@ class RemotionCaptionBurn(BaseTool):
         dur_result = self.run_command(dur_cmd)
         dur_out = dur_result.stdout
         duration_s = float(dur_out.strip().split("\n")[0])
-        total_frames = math.ceil(duration_s * 30)
+        if not fps:
+            fps = self._probe_fps(input_path) or 30
+        total_frames = math.ceil(duration_s * fps)
 
         # Detect video dimensions
         dim_cmd = [
@@ -320,6 +358,7 @@ class RemotionCaptionBurn(BaseTool):
             "wordsPerPage": words_per_page,
             "fontSize": font_size,
             "highlightColor": highlight_color,
+            **(caption_style or {}),
         }
         props_dir = root / "public" / "demo-props"
         props_dir.mkdir(parents=True, exist_ok=True)
@@ -333,7 +372,7 @@ class RemotionCaptionBurn(BaseTool):
             npx_bin, "remotion", "render",
             "TalkingHead",
             f"--props={props_file.relative_to(root)}",
-            f"--width={width}", f"--height={height}", "--fps=30",
+            f"--width={width}", f"--height={height}", f"--fps={fps:g}",
             f"--frames=0-{total_frames - 1}",
             "--codec=h264", "--crf=18",
             f"--output={str(Path(output_path).resolve())}",
@@ -486,6 +525,16 @@ class RemotionCaptionBurn(BaseTool):
                 input_path, output_path, captions,
                 words_per_page, font_size, highlight_color,
                 overlays=overlays,
+                caption_style={
+                    key: inputs[name]
+                    for name, key in (
+                        ("caption_bottom_offset", "captionBottomOffset"),
+                        ("caption_font_family", "captionFontFamily"),
+                        ("caption_background_color", "captionBackgroundColor"),
+                    )
+                    if inputs.get(name) is not None
+                },
+                fps=inputs.get("fps"),
             )
         else:
             result = self._render_ffmpeg(input_path, output_path, captions)
