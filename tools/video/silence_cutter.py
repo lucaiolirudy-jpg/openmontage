@@ -33,7 +33,7 @@ from tools.base_tool import (
 
 class SilenceCutter(BaseTool):
     name = "silence_cutter"
-    version = "0.1.1"
+    version = "0.2.0"
     tier = ToolTier.CORE
     capability = "video_post"
     provider = "ffmpeg"
@@ -197,8 +197,10 @@ class SilenceCutter(BaseTool):
 
         elapsed = time.time() - start
 
-        silence_dur = sum(s["duration"] for s in silences)
         speech_dur = sum(s["end"] - s["start"] for s in speech_segments)
+        # Time actually removed (detected silence minus the padding kept
+        # around speech), not the raw detected silence.
+        silence_dur = max(total_duration - speech_dur, 0.0)
 
         return ToolResult(
             success=True,
@@ -266,6 +268,23 @@ class SilenceCutter(BaseTool):
         except Exception:
             return 0.0
 
+    def _get_fps(self, input_path: Path) -> float:
+        """Get the video frame rate via ffprobe (defaults to 30)."""
+        cmd = [
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+            "-of", "json", str(input_path),
+        ]
+        try:
+            stream = json.loads(self.run_command(cmd).stdout)["streams"][0]
+            for key in ("avg_frame_rate", "r_frame_rate"):
+                num, _, den = stream.get(key, "0/0").partition("/")
+                if float(num or 0) > 0 and float(den or 0) > 0:
+                    return float(num) / float(den)
+        except Exception:
+            pass
+        return 30.0
+
     def _compute_speech_segments(
         self, silences: list[dict], total_duration: float, padding: float
     ) -> list[dict]:
@@ -301,64 +320,71 @@ class SilenceCutter(BaseTool):
         speech_segments: list[dict],
         codec: str, crf: int,
     ) -> ToolResult:
-        """Remove silence by concatenating speech segments."""
+        """Remove silence by keeping only the speech segments.
+
+        Single pass with select/aselect: one decode of the source and one
+        continuous stream, so memory stays flat regardless of segment count
+        (a trim-per-segment graph buffers frames for every branch and can OOM
+        on long HD footage). This also avoids re-seeking the file once per
+        segment and concatenating independently encoded AAC chunks, which can
+        leave gaps or clicks at the joins.
+        """
         if not speech_segments:
             return ToolResult(success=False, error="No speech segments found")
 
-        temp_dir = output_path.parent / ".silence_cut_tmp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        # Snap every cut to the video frame grid so audio and video keep
+        # exactly the same spans; otherwise per-cut rounding of whole video
+        # frames accumulates into audible A/V drift over many cuts.
+        fps = self._get_fps(input_path)
+        snapped = []
+        for seg in speech_segments:
+            a = round(seg["start"] * fps) / fps
+            b = round(seg["end"] * fps) / fps
+            if b > a:
+                snapped.append((a, b))
+        if not snapped:
+            return ToolResult(success=False, error="No speech segments found")
+        half = 0.5 / fps  # video frame timestamps sit exactly on the grid
+        keep_v = "+".join(
+            f"between(t,{a - half:.5f},{b - half:.5f})" for a, b in snapped
+        )
+        # Pick audio chunks by their centre over a half-open [a, b) span so
+        # per-cut rounding is unbiased and does not accumulate into drift.
+        keep_a = "+".join(
+            f"gte(t+samples_n/(2*sample_rate),{a:.5f})"
+            f"*lt(t+samples_n/(2*sample_rate),{b:.5f})"
+            for a, b in snapped
+        )
+        graph = (
+            f"[0:v]select='{keep_v}',setpts=N/FRAME_RATE/TB[outv];\n"
+            # Small audio chunks (64 samples, ~1.3 ms at 48 kHz) so aselect
+            # cuts stay aligned with the frame-accurate video.
+            f"[0:a]asetnsamples=n=64:p=0,aselect='{keep_a}',asetpts=N/SR/TB[outa]"
+        )
 
+        script_path = output_path.with_suffix(".filter.txt")
         try:
-            # Cut each speech segment
-            seg_files = []
-            for i, seg in enumerate(speech_segments):
-                seg_path = temp_dir / f"seg_{i:04d}.mp4"
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(input_path),
-                    "-ss", f"{seg['start']:.3f}",
-                    "-to", f"{seg['end']:.3f}",
-                    "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-                    "-c:a", "aac", "-b:a", "192k",
-                    # Force keyframe at start for clean cuts
-                    "-force_key_frames", f"{seg['start']:.3f}",
-                    str(seg_path),
-                ]
-                self.run_command(cmd, timeout=120)
-                if seg_path.exists() and seg_path.stat().st_size > 0:
-                    seg_files.append(seg_path)
-
-            if not seg_files:
-                return ToolResult(success=False, error="No segments were successfully cut")
-
-            # Concat all segments
-            list_path = temp_dir / "concat_list.txt"
-            with open(list_path, "w", encoding="utf-8") as f:
-                for sf in seg_files:
-                    safe_path = str(sf.resolve()).replace("\\", "/")
-                    f.write(f"file '{safe_path}'\n")
-
+            script_path.write_text(graph, encoding="utf-8")
             cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(list_path),
-                "-c", "copy",
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(input_path),
+                "-filter_complex_script", str(script_path),
+                "-map", "[outv]", "-map", "[outa]",
+                "-c:v", codec, "-crf", str(crf), "-preset", "medium",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
                 str(output_path),
             ]
-            self.run_command(cmd, timeout=120)
-
+            self.run_command(cmd, timeout=3600)
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                return ToolResult(success=False, error="Jump cut render produced no output")
             return ToolResult(success=True)
         except Exception as e:
             return ToolResult(success=False, error=f"Jump cut render failed: {e}")
         finally:
-            # Clean up temp files
-            for f in temp_dir.glob("*"):
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
             try:
-                temp_dir.rmdir()
+                script_path.unlink()
             except OSError:
                 pass
 
