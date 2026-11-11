@@ -75,6 +75,29 @@ class SilenceCutter(BaseTool):
                 "minimum": 0.1,
                 "description": "Minimum silence duration in seconds to trigger a cut",
             },
+            "keep_segments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["start", "end"],
+                    "properties": {
+                        "start": {"type": "number"},
+                        "end": {"type": "number"},
+                    },
+                },
+                "description": (
+                    "remove mode only: explicit spans (seconds) to keep, e.g. a "
+                    "plan that also drops breaths/sighs. Skips silence detection."
+                ),
+            },
+            "audio_path": {
+                "type": "string",
+                "description": (
+                    "remove mode only: replacement audio track (e.g. a denoised "
+                    "version of the source audio, same timeline) used instead of "
+                    "the video's own audio."
+                ),
+            },
             "padding_seconds": {
                 "type": "number",
                 "default": 0.08,
@@ -120,6 +143,20 @@ class SilenceCutter(BaseTool):
         threshold_db = inputs.get("silence_threshold_db", -35)
         min_dur = inputs.get("min_silence_duration", 0.5)
         padding = inputs.get("padding_seconds", 0.08)
+
+        keep_segments = inputs.get("keep_segments")
+        audio_path = inputs.get("audio_path")
+        if audio_path and not Path(audio_path).exists():
+            return ToolResult(success=False, error=f"Audio not found: {audio_path}")
+        if (keep_segments or audio_path) and mode != "remove":
+            return ToolResult(
+                success=False,
+                error="keep_segments/audio_path are only supported in remove mode",
+            )
+        if keep_segments:
+            return self._execute_keep_segments(
+                input_path, inputs, keep_segments, audio_path, start
+            )
 
         silences = self._detect_silence(input_path, threshold_db, min_dur)
 
@@ -217,6 +254,60 @@ class SilenceCutter(BaseTool):
             },
             artifacts=[str(output_path)],
             duration_seconds=round(elapsed, 2),
+        )
+
+    def _execute_keep_segments(
+        self,
+        input_path: Path,
+        inputs: dict[str, Any],
+        keep_segments: list[dict],
+        audio_path: str | None,
+        start: float,
+    ) -> ToolResult:
+        """Render an explicit keep-list (e.g. pauses + breaths removed)."""
+        total_duration = self._get_duration(input_path)
+        segments = sorted(
+            (
+                {"start": max(0.0, float(s["start"])),
+                 "end": min(float(s["end"]), total_duration or float(s["end"]))}
+                for s in keep_segments
+            ),
+            key=lambda s: s["start"],
+        )
+        segments = [s for s in segments if s["end"] > s["start"]]
+        if not segments:
+            return ToolResult(success=False, error="keep_segments is empty")
+
+        output_path = Path(
+            inputs.get("output_path", str(input_path.with_stem(f"{input_path.stem}_cut")))
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        result = self._render_jump_cut(
+            input_path, output_path, segments,
+            inputs.get("codec", "libx264"), inputs.get("crf", 18),
+            audio_path=Path(audio_path) if audio_path else None,
+        )
+        if not result.success:
+            return result
+
+        kept = sum(s["end"] - s["start"] for s in segments)
+        removed = max(total_duration - kept, 0.0)
+        return ToolResult(
+            success=True,
+            data={
+                "mode": "remove",
+                "source": "keep_segments",
+                "input": str(input_path),
+                "output": str(output_path),
+                "audio": str(audio_path) if audio_path else "source",
+                "input_duration": round(total_duration, 2),
+                "output_duration": round(kept, 2),
+                "silence_removed_seconds": round(removed, 2),
+                "speech_segments": len(segments),
+                "time_saved_percent": round(removed / total_duration * 100, 1) if total_duration > 0 else 0,
+            },
+            artifacts=[str(output_path)],
+            duration_seconds=round(time.time() - start, 2),
         )
 
     def _detect_silence(
@@ -319,6 +410,7 @@ class SilenceCutter(BaseTool):
         input_path: Path, output_path: Path,
         speech_segments: list[dict],
         codec: str, crf: int,
+        audio_path: Path | None = None,
     ) -> ToolResult:
         """Remove silence by keeping only the speech segments.
 
@@ -359,7 +451,7 @@ class SilenceCutter(BaseTool):
             f"[0:v]select='{keep_v}',setpts=N/FRAME_RATE/TB[outv];\n"
             # Small audio chunks (64 samples, ~1.3 ms at 48 kHz) so aselect
             # cuts stay aligned with the frame-accurate video.
-            f"[0:a]asetnsamples=n=64:p=0,aselect='{keep_a}',asetpts=N/SR/TB[outa]"
+            f"[{1 if audio_path else 0}:a]asetnsamples=n=64:p=0,aselect='{keep_a}',asetpts=N/SR/TB[outa]"
         )
 
         script_path = output_path.with_suffix(".filter.txt")
@@ -368,6 +460,7 @@ class SilenceCutter(BaseTool):
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(input_path),
+                *(["-i", str(audio_path)] if audio_path else []),
                 "-filter_complex_script", str(script_path),
                 "-map", "[outv]", "-map", "[outa]",
                 "-c:v", codec, "-crf", str(crf), "-preset", "medium",
